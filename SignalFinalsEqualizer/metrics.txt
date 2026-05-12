@@ -1,0 +1,36 @@
+Metrics for: C:\Users\User\Desktop\Programming languages for vs\Python\SignalFinal\SignalFinalsEqualizer\test_voice_snr15_fan_hum.wav
+Sample rate : 16000 Hz
+Length      : 8.02 s
+
+=== Stage 1: Spectral Subtraction (broadband fan noise) ===
+Metric                                RAW (dB)  AFTER (dB)    Δ (dB)
+--------------------------------------------------------------------
+  Speech-band SNR (200-3kHz)            11.2        13.3      +2.1
+  Noise floor (10th pctile)            -17.6       -24.0      -6.4
+  Power @ 150 Hz (fan BPF)              67.2        54.4     -12.8
+  Power @ 300 Hz (fan 2H)               67.7        55.7     -12.0
+
+=== Stage 2: IIR Notch Cascade (60/120/180 Hz hum) ===
+Metric                                RAW (dB)  AFTER (dB)    Δ (dB)
+--------------------------------------------------------------------
+  Power @ 60 Hz (hum)                   72.7        41.8     -30.9
+  Power @ 120 Hz (2nd harm)             66.5        35.6     -30.9
+  Power @ 180 Hz (3rd harm)             62.5        35.7     -26.8
+  Power @ 250 Hz (control)              47.8        47.8      -0.0
+
+=== Combined: SS + Notch + Low-pass ===
+Metric                                RAW (dB)  AFTER (dB)    Δ (dB)
+--------------------------------------------------------------------
+  Speech-band SNR (200-3kHz)            11.2        13.8      +2.6
+  Power @ 60 Hz (hum)                   72.7        40.9     -31.8
+  Noise floor (10th pctile)            -17.6       -30.3     -12.7
+  Power @ 8 kHz (hiss)                  30.3       -49.4     -79.7
+
+=== Reference-based (vs. clean_voice) ===
+Metric                                     RAW       AFTER         Δ
+--------------------------------------------------------------------
+  Segmental SNR (dB)                    -5.4        -4.6      +0.8
+  PESQ (wideband, 1.0-4.5)                1.05        1.13     +0.09
+  STOI (intelligibility, 0-1)            0.797       0.821    +0.024
+
+SS α=2.0  β=0.02  smooth=0.7  NFFT=1024

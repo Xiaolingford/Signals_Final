@@ -1,7 +1,7 @@
 """
 equalizer.py
 ============
-Real-Time Audio Equalizer / Noise Filter — Signals & Systems demo.
+Real-Time Voice Denoiser — Signals & Systems demo.
 macOS-compatible: uses SEPARATE input and output streams,
 supports device selection, and resamples internally if needed.
 
@@ -14,16 +14,17 @@ Modes:
     python equalizer.py --fs 44100                   # force native sample rate
 
 Filters (toggle live):
-    [Notch 60 Hz]       IIR notch — kills mains hum
-    [Low-pass]          FIR Hamming-windowed sinc — kills hiss
-    [Spectral Sub]      Spectral subtraction — kills broadband fan noise
+    [Notch 60 Hz]       IIR notch cascade (60, 120, 180 Hz) — kills mains hum
+    [Low-pass]          FIR Hamming-windowed sinc — kills hiss above speech
+    [Spectral Sub]      STFT spectral subtraction with Wiener-style smoothing
+                        — kills broadband fan / HVAC noise
 
 Calibration:
-    Click [Calibrate Noise] while only fan noise is present (~2 s).
+    Click [Calibrate Noise] while only background noise is present (~2 s).
 
-S&S concepts:
-    IIR notch, FIR low-pass via windowing, STFT spectral subtraction,
-    FFT / spectrogram, overlap-add reconstruction.
+S&S concepts demonstrated:
+    IIR notch cascade, FIR low-pass via windowing, STFT spectral subtraction,
+    Wiener gain, FFT / spectrogram, overlap-add reconstruction.
 """
 
 import argparse
@@ -41,49 +42,66 @@ from matplotlib.animation import FuncAnimation
 # ---------------------------------------------------------------------------
 # Config  (overridable via CLI)
 # ---------------------------------------------------------------------------
-FS_DEFAULT  = 8000
-BLOCK       = 512      # larger block = more stable on macOS Core Audio
+FS_DEFAULT  = 16000     # wideband speech (was 8 kHz telephony)
+BLOCK       = 1024      # larger block = more stable on macOS Core Audio
 SPEC_SECONDS = 4
-SPEC_NFFT   = 512
+SPEC_NFFT   = 1024
 
-NOTCH_FREQ  = 60.0
+# 60 Hz hum + 2nd and 3rd harmonics (real mains interference has these)
+NOTCH_FREQS = [60.0, 120.0, 180.0]
 NOTCH_Q     = 30.0
-LP_CUTOFF   = 3400.0
+
+# Low-pass: speech intelligibility lives < 7 kHz; cut above that for hiss
+LP_CUTOFF   = 7000.0
 LP_TAPS     = 101
 
-SS_ALPHA    = 2.0
-SS_BETA     = 0.02
+# Spectral subtraction
+SS_ALPHA    = 2.0       # over-subtraction factor
+SS_BETA     = 0.02      # spectral floor (prevents negative magnitudes)
+SS_SMOOTH   = 0.7       # temporal smoothing of the Wiener gain (0..1)
 SS_CAL_SECS = 2.0
 
 
 # ---------------------------------------------------------------------------
-# SpectralSubtractor  (sqrt-Hanning overlap-add STFT)
+# SpectralSubtractor  (Wiener-style, sqrt-Hanning overlap-add STFT)
 # ---------------------------------------------------------------------------
 class SpectralSubtractor:
     """
-    STFT spectral subtraction with perfect-reconstruction overlap-add.
+    STFT spectral subtraction with TEMPORAL SMOOTHING of the gain.
     hop must equal nfft // 2 (50% overlap) for sqrt-Hanning COLA to hold.
 
-    Subtraction:  |Y(k)| = max( |X(k)| - alpha*|N(k)|,  beta*|N(k)| )
+    For each frame:
+        SNR_post = |X(k)|^2 / |N(k)|^2
+        gain     = SNR_post / (1 + SNR_post)         (Wiener)
+        gain     = smooth_prev*gain_prev + (1-smooth)*gain
+        gain     = max(gain, beta)                    (spectral floor)
+        Y(k)     = gain * X(k)
+
+    The temporal smoothing kills "musical noise" — the tinkly random tones
+    that plain magnitude subtraction leaves behind — which is much more
+    obvious on speech than on tonal signals.
     """
 
-    def __init__(self, nfft, hop, alpha=SS_ALPHA, beta=SS_BETA):
+    def __init__(self, nfft, hop, alpha=SS_ALPHA, beta=SS_BETA, smooth=SS_SMOOTH):
         assert hop == nfft // 2
-        self.nfft  = nfft
-        self.hop   = hop
-        self.alpha = alpha
-        self.beta  = beta
-        self.nbins = nfft // 2 + 1
-        self.win   = np.sqrt(np.hanning(nfft)).astype(np.float32)
+        self.nfft   = nfft
+        self.hop    = hop
+        self.alpha  = alpha
+        self.beta   = beta
+        self.smooth = smooth
+        self.nbins  = nfft // 2 + 1
+        self.win    = np.sqrt(np.hanning(nfft)).astype(np.float32)
 
         self.noise_mag  = np.zeros(self.nbins, dtype=np.float32)
         self.calibrated = False
         self.enabled    = False
 
-        self._in_buf  = np.zeros(nfft, dtype=np.float32)
-        self._out_buf = np.zeros(nfft, dtype=np.float32)
+        self._in_buf    = np.zeros(nfft, dtype=np.float32)
+        self._out_buf   = np.zeros(nfft, dtype=np.float32)
+        self._gain_prev = np.ones(self.nbins, dtype=np.float32)
 
     def calibrate(self, noise_frames):
+        """Average magnitude spectrum over ~2 s of noise-only audio."""
         mags = []
         buf  = np.zeros(self.nfft, dtype=np.float32)
         for blk in noise_frames:
@@ -93,25 +111,42 @@ class SpectralSubtractor:
         if mags:
             self.noise_mag  = np.mean(mags, axis=0).astype(np.float32)
             self.calibrated = True
+            # Reset smoothed gain
+            self._gain_prev = np.ones(self.nbins, dtype=np.float32)
 
     def process(self, block):
+        # Shift in `hop` new samples
         self._in_buf[:-self.hop] = self._in_buf[self.hop:]
         self._in_buf[-self.hop:] = block.astype(np.float32)
 
         if not self.enabled or not self.calibrated:
             return self._in_buf[:self.hop].copy()
 
-        frame     = self._in_buf * self.win
-        X         = np.fft.rfft(frame)
-        mag       = np.abs(X)
-        phase     = np.angle(X)
-        mag_clean = np.maximum(mag - self.alpha * self.noise_mag,
-                               self.beta  * self.noise_mag)
+        frame = self._in_buf * self.win
+        X     = np.fft.rfft(frame)
+        mag   = np.abs(X)
+        phase = np.angle(X)
+
+        # Wiener-style gain (better than hard subtraction for speech)
+        noise_pow = self.alpha * (self.noise_mag ** 2) + 1e-12
+        sig_pow   = mag ** 2
+        snr_post  = sig_pow / noise_pow
+        gain_raw  = snr_post / (1.0 + snr_post)
+
+        # Temporal smoothing — kills musical noise
+        gain      = self.smooth * self._gain_prev + (1 - self.smooth) * gain_raw
+        self._gain_prev = gain
+
+        # Spectral floor so we never zero a bin completely
+        gain = np.maximum(gain, self.beta).astype(np.float32)
+
+        mag_clean = mag * gain
         y_frame   = np.fft.irfft(mag_clean * np.exp(1j * phase)).real.astype(np.float32)
         y_frame  *= self.win
 
-        self._out_buf       += y_frame
-        out                  = self._out_buf[:self.hop].copy()
+        # Overlap-add
+        self._out_buf            += y_frame
+        out                       = self._out_buf[:self.hop].copy()
         self._out_buf[:-self.hop] = self._out_buf[self.hop:]
         self._out_buf[-self.hop:] = 0.0
         return out
@@ -127,9 +162,10 @@ state = {
     'cal_mode': False,
 }
 
-# These are filled in by _init_filters() once the real FS is known
-_notch_b = _notch_a = _lp_b = _lp_a = None
-_notch_zi = _lp_zi = None
+# Notch cascade: list of (b, a, zi) — built in _init_filters()
+_notch_stages: list = []
+_lp_b = _lp_a = None
+_lp_zi = None
 ss: SpectralSubtractor | None = None
 
 audio_q    = queue.Queue(maxsize=128)
@@ -139,45 +175,50 @@ ring: np.ndarray = np.zeros(1, dtype=np.float32)  # resized in run()
 
 
 def _init_filters(fs: int):
-    global _notch_b, _notch_a, _lp_b, _lp_a, _notch_zi, _lp_zi, ss
+    global _notch_stages, _lp_b, _lp_a, _lp_zi, ss
 
-    notch_f = min(NOTCH_FREQ, fs / 2 - 1.0)
-    lp_f    = min(LP_CUTOFF,  fs / 2 - 100.0)
+    # Cascade a notch at each harmonic that fits below Nyquist
+    _notch_stages = []
+    for f0 in NOTCH_FREQS:
+        if f0 < fs / 2 - 1.0:
+            b, a = signal.iirnotch(f0, NOTCH_Q, fs=fs)
+            zi   = signal.lfilter_zi(b, a) * 0.0
+            _notch_stages.append([b, a, zi])
 
-    _notch_b, _notch_a = signal.iirnotch(notch_f, NOTCH_Q, fs=fs)
-    _lp_b               = signal.firwin(LP_TAPS, lp_f, fs=fs, window='hamming')
-    _lp_a               = np.array([1.0])
-    _notch_zi           = signal.lfilter_zi(_notch_b, _notch_a) * 0.0
-    _lp_zi              = signal.lfilter_zi(_lp_b,    _lp_a)    * 0.0
+    lp_f = min(LP_CUTOFF, fs / 2 - 100.0)
+    _lp_b  = signal.firwin(LP_TAPS, lp_f, fs=fs, window='hamming')
+    _lp_a  = np.array([1.0])
+    _lp_zi = signal.lfilter_zi(_lp_b, _lp_a) * 0.0
 
     # Choose SS NFFT so that hop (= nfft//2) <= BLOCK
     nfft = SPEC_NFFT
     while nfft // 2 > BLOCK:
         nfft //= 2
     ss = SpectralSubtractor(nfft=nfft, hop=nfft // 2,
-                            alpha=SS_ALPHA, beta=SS_BETA)
+                            alpha=SS_ALPHA, beta=SS_BETA, smooth=SS_SMOOTH)
 
 
 # ---------------------------------------------------------------------------
 # DSP pipeline (called from audio thread — keep it fast)
 # ---------------------------------------------------------------------------
 def process(x: np.ndarray) -> np.ndarray:
-    global _notch_zi, _lp_zi
+    global _lp_zi
     y = x.astype(np.float32, copy=True)
 
     if state['spec_sub'] and ss is not None:
         hop = ss.hop
+        # Caller guarantees len(y) is a multiple of hop (BLOCK is set that way)
+        assert len(y) % hop == 0, f'block length {len(y)} not divisible by hop {hop}'
         out = np.empty_like(y)
         for i in range(0, len(y), hop):
-            chunk = y[i:i + hop]
-            pad   = hop - len(chunk)
-            if pad:
-                chunk = np.pad(chunk, (0, pad))
-            out[i:i + hop] = ss.process(chunk)[:len(y[i:i + hop])]
+            out[i:i + hop] = ss.process(y[i:i + hop])
         y = out
 
-    if state['notch'] and _notch_b is not None:
-        y, _notch_zi = signal.lfilter(_notch_b, _notch_a, y, zi=_notch_zi)
+    if state['notch'] and _notch_stages:
+        # Cascade: pass through each (b, a) stage in turn, preserving state
+        for stage in _notch_stages:
+            b, a, zi = stage
+            y, stage[2] = signal.lfilter(b, a, y, zi=zi)
 
     if state['lowpass'] and _lp_b is not None:
         y, _lp_zi = signal.lfilter(_lp_b, _lp_a, y, zi=_lp_zi)
@@ -275,10 +316,11 @@ def start_calibration(n_blocks, done_cb):
 # Metrics
 # ---------------------------------------------------------------------------
 def rough_snr_db(x, fs):
+    """Crude speech-band SNR estimate (200–3000 Hz speech vs > 3500 Hz noise)."""
     X   = np.abs(np.fft.rfft(x)) ** 2
     f   = np.fft.rfftfreq(len(x), 1 / fs)
-    sig = X[(f >= 200) & (f <= 2000)].sum() + 1e-12
-    noi = X[f > 2500].sum() + 1e-12
+    sig = X[(f >= 200) & (f <= 3000)].sum() + 1e-12
+    noi = X[f > 3500].sum() + 1e-12
     return 10 * np.log10(sig / noi)
 
 def power_at(x, freq, fs, bw=5.0):
@@ -294,7 +336,7 @@ def power_at(x, freq, fs, bw=5.0):
 def build_ui(fs: int):
     plt.style.use('dark_background')
     fig = plt.figure(figsize=(14, 8))
-    fig.canvas.manager.set_window_title('Real-Time Denoiser — S&S Demo')
+    fig.canvas.manager.set_window_title('Real-Time Voice Denoiser — S&S Demo')
 
     gs = fig.add_gridspec(3, 5, height_ratios=[4, 1.4, 0.65],
                           hspace=0.45, wspace=0.3)
@@ -309,8 +351,11 @@ def build_ui(fs: int):
     ax_spec.set_xlabel('Time (s)')
     ax_spec.set_ylabel('Frequency (Hz)')
     ax_spec.set_title('Live Spectrogram  —  toggle filters below')
-    ax_spec.axhline(min(60, fs/2-1),       color='cyan', alpha=0.4, lw=0.8, ls='--')
-    ax_spec.axhline(min(LP_CUTOFF, fs/2-1),color='lime', alpha=0.4, lw=0.8, ls='--')
+    for f0 in NOTCH_FREQS:
+        if f0 < fs / 2:
+            ax_spec.axhline(f0, color='cyan', alpha=0.3, lw=0.6, ls='--')
+    if LP_CUTOFF < fs / 2:
+        ax_spec.axhline(LP_CUTOFF, color='lime', alpha=0.4, lw=0.8, ls='--')
     fig.colorbar(im, ax=ax_spec, label='dB')
 
     ax_wave = fig.add_subplot(gs[1, :])
@@ -330,7 +375,7 @@ def build_ui(fs: int):
                    fontsize=10, family='monospace', color='white',
                    transform=ax_m.transAxes)
 
-    b_notch = Button(ax_b1, 'Notch 60Hz: OFF',   color='#2a2a2a', hovercolor='#444')
+    b_notch = Button(ax_b1, 'Hum Notches: OFF',  color='#2a2a2a', hovercolor='#444')
     b_lp    = Button(ax_b2, 'Low-pass: OFF',      color='#2a2a2a', hovercolor='#444')
     b_ss    = Button(ax_b3, 'Spectral Sub: OFF',  color='#2a2a2a', hovercolor='#444')
     b_cal   = Button(ax_b4, 'Calibrate Noise',    color='#1a3a5c', hovercolor='#2456a4')
@@ -342,9 +387,12 @@ def build_ui(fs: int):
                         transform=ax_b4.transAxes)
 
     def refresh():
-        b_notch.label.set_text(f"Notch 60Hz: {'ON' if state['notch'] else 'OFF'}")
+        b_notch.label.set_text(f"Hum Notches: {'ON' if state['notch'] else 'OFF'}")
         b_lp.label.set_text(   f"Low-pass: {'ON' if state['lowpass'] else 'OFF'}")
         b_ss.label.set_text(   f"Spectral Sub: {'ON' if state['spec_sub'] else 'OFF'}")
+        # Also sync SS enabled flag so the class actually does work
+        if ss is not None:
+            ss.enabled = state['spec_sub']
         b_notch.color = '#1e6b1e' if state['notch']    else '#2a2a2a'
         b_lp.color    = '#1e6b1e' if state['lowpass']  else '#2a2a2a'
         b_ss.color    = '#4a2080' if state['spec_sub'] else '#2a2a2a'
@@ -389,7 +437,6 @@ def run(source='mic', wav_path=None, device_in=None, device_out=None,
             print(f"[audio] Device native rate {native} Hz → using that (was {fs} Hz).")
             fs = native
     elif fs_override is None:
-        # Check default output device
         _, default_out_idx = sd.default.device
         if default_out_idx is not None and default_out_idx >= 0:
             info = sd.query_devices(default_out_idx)
@@ -451,10 +498,10 @@ def run(source='mic', wav_path=None, device_in=None, device_out=None,
         recent = ring[-fs:]
         cal    = '✓' if (ss and ss.calibrated) else '–'
         mt.set_text(
-            f"SNR (band):   {rough_snr_db(recent, fs):5.1f} dB\n"
-            f"60 Hz pwr:    {power_at(recent, min(60, fs//2-1), fs):5.1f} dB\n"
-            f"Fan (~300 Hz):{power_at(recent, min(300, fs//2-1), fs, bw=200):5.1f} dB\n"
-            f"Calibrated:   {cal}\n"
+            f"SNR (band):     {rough_snr_db(recent, fs):5.1f} dB\n"
+            f"60 Hz power:    {power_at(recent, 60.0, fs):5.1f} dB\n"
+            f"Fan (~150 Hz):  {power_at(recent, 150.0, fs, bw=20):5.1f} dB\n"
+            f"Calibrated:     {cal}\n"
             f"FS: {fs} Hz"
         )
         return im, line, mt
@@ -473,7 +520,7 @@ def run(source='mic', wav_path=None, device_in=None, device_out=None,
 
 
 if __name__ == '__main__':
-    p = argparse.ArgumentParser(description='Real-time denoiser — macOS-compatible')
+    p = argparse.ArgumentParser(description='Real-time voice denoiser — macOS-compatible')
     p.add_argument('--file',         default=None,        help='WAV file (omit for mic)')
     p.add_argument('--device-in',    type=int, default=None, help='Input device index')
     p.add_argument('--device-out',   type=int, default=None, help='Output device index')
@@ -481,14 +528,17 @@ if __name__ == '__main__':
     p.add_argument('--list-devices', action='store_true',   help='Print devices and exit')
     p.add_argument('--alpha',        type=float, default=SS_ALPHA)
     p.add_argument('--beta',         type=float, default=SS_BETA)
+    p.add_argument('--smooth',       type=float, default=SS_SMOOTH,
+                   help='Wiener-gain temporal smoothing (0..1, higher = smoother)')
     args = p.parse_args()
 
     if args.list_devices:
         print(sd.query_devices())
         sys.exit(0)
 
-    SS_ALPHA = args.alpha
-    SS_BETA  = args.beta
+    SS_ALPHA  = args.alpha
+    SS_BETA   = args.beta
+    SS_SMOOTH = args.smooth
 
     if args.file is None:
         # Quick mic permission check on macOS
