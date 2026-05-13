@@ -28,9 +28,11 @@ S&S concepts demonstrated:
 """
 
 import argparse
+import os
 import queue
 import sys
 import threading
+import time
 import numpy as np
 import sounddevice as sd
 import scipy.signal as signal
@@ -38,6 +40,9 @@ from scipy.io import wavfile
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Button
 from matplotlib.animation import FuncAnimation
+
+# Resolve paths relative to THIS script (works regardless of CWD)
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ---------------------------------------------------------------------------
 # Config  (overridable via CLI)
@@ -156,10 +161,11 @@ class SpectralSubtractor:
 # Shared mutable state
 # ---------------------------------------------------------------------------
 state = {
-    'notch'   : False,
-    'lowpass' : False,
-    'spec_sub': False,
-    'cal_mode': False,
+    'notch'    : False,
+    'lowpass'  : False,
+    'spec_sub' : False,
+    'cal_mode' : False,
+    'recording': False,
 }
 
 # Notch cascade: list of (b, a, zi) — built in _init_filters()
@@ -172,6 +178,38 @@ audio_q    = queue.Queue(maxsize=128)
 cal_q      = queue.Queue(maxsize=2048)
 _mic_out_q = queue.Queue(maxsize=32)
 ring: np.ndarray = np.zeros(1, dtype=np.float32)  # resized in run()
+
+# Recording buffers — list.append is atomic in CPython, safe across threads
+_rec_raw_blocks:  list[np.ndarray] = []
+_rec_proc_blocks: list[np.ndarray] = []
+
+
+def save_recording(fs: int) -> tuple[str | None, str | None, float]:
+    """
+    Concatenate accumulated recording blocks, normalise, save TWO WAV files
+    (raw input + processed output) with a timestamp, then clear buffers.
+    Returns (raw_path, processed_path, duration_seconds) or (None, None, 0).
+    """
+    if not _rec_raw_blocks:
+        return None, None, 0.0
+
+    raw  = np.concatenate(_rec_raw_blocks).astype(np.float32)
+    proc = np.concatenate(_rec_proc_blocks).astype(np.float32)
+    _rec_raw_blocks.clear()
+    _rec_proc_blocks.clear()
+
+    def to_int16(x: np.ndarray) -> np.ndarray:
+        peak = float(np.max(np.abs(x))) + 1e-12
+        if peak > 0.95:
+            x = x * (0.95 / peak)
+        return (np.clip(x, -1.0, 1.0) * 32767).astype(np.int16)
+
+    ts        = time.strftime('%Y%m%d_%H%M%S')
+    raw_path  = os.path.join(SCRIPT_DIR, f'recording_{ts}_raw.wav')
+    proc_path = os.path.join(SCRIPT_DIR, f'recording_{ts}_proc.wav')
+    wavfile.write(raw_path,  fs, to_int16(raw))
+    wavfile.write(proc_path, fs, to_int16(proc))
+    return raw_path, proc_path, len(raw) / fs
 
 
 def _init_filters(fs: int):
@@ -240,7 +278,11 @@ def process(x: np.ndarray) -> np.ndarray:
 def _mic_in_cb(indata, frames, time_info, status):
     if status:
         print(f"[mic-in]  {status}", file=sys.stderr)
-    y = process(indata[:, 0])
+    raw = indata[:, 0].copy()       # indata buffer gets reused — must copy
+    y   = process(raw)
+    if state['recording']:
+        _rec_raw_blocks.append(raw)
+        _rec_proc_blocks.append(y.copy())
     try:
         _mic_out_q.put_nowait(y)
     except queue.Full:
@@ -275,8 +317,12 @@ def make_file_cb(data: np.ndarray):
             idx[0] = frames - len(data[i:end])
         else:
             idx[0] = end % len(data)
+        raw_in = blk.copy()
         y = process(blk)
         outdata[:, 0] = y
+        if state['recording']:
+            _rec_raw_blocks.append(raw_in)
+            _rec_proc_blocks.append(y.copy())
         try:
             audio_q.put_nowait(y.copy())
         except queue.Full:
@@ -338,7 +384,8 @@ def build_ui(fs: int):
     fig = plt.figure(figsize=(14, 8))
     fig.canvas.manager.set_window_title('Real-Time Voice Denoiser — S&S Demo')
 
-    gs = fig.add_gridspec(3, 5, height_ratios=[4, 1.4, 0.65],
+    gs = fig.add_gridspec(3, 6, height_ratios=[4, 1.4, 0.65],
+                          width_ratios=[1, 1, 1, 1, 1, 2.2],
                           hspace=0.45, wspace=0.3)
 
     ax_spec = fig.add_subplot(gs[0, :])
@@ -369,7 +416,8 @@ def build_ui(fs: int):
     ax_b2 = fig.add_subplot(gs[2, 1])
     ax_b3 = fig.add_subplot(gs[2, 2])
     ax_b4 = fig.add_subplot(gs[2, 3])
-    ax_m  = fig.add_subplot(gs[2, 4]); ax_m.axis('off')
+    ax_b5 = fig.add_subplot(gs[2, 4])
+    ax_m  = fig.add_subplot(gs[2, 5]); ax_m.axis('off')
 
     mt = ax_m.text(0.0, 0.5, '', ha='left', va='center',
                    fontsize=10, family='monospace', color='white',
@@ -379,12 +427,16 @@ def build_ui(fs: int):
     b_lp    = Button(ax_b2, 'Low-pass: OFF',      color='#2a2a2a', hovercolor='#444')
     b_ss    = Button(ax_b3, 'Spectral Sub: OFF',  color='#2a2a2a', hovercolor='#444')
     b_cal   = Button(ax_b4, 'Calibrate Noise',    color='#1a3a5c', hovercolor='#2456a4')
-    for b in (b_notch, b_lp, b_ss, b_cal):
+    b_rec   = Button(ax_b5, 'Record: OFF',        color='#2a2a2a', hovercolor='#444')
+    for b in (b_notch, b_lp, b_ss, b_cal, b_rec):
         b.label.set_fontsize(10)
 
     cal_st = ax_b4.text(0.5, -0.45, '', ha='center', va='top',
                         fontsize=8, color='#88ccff',
                         transform=ax_b4.transAxes)
+    rec_st = ax_b5.text(0.5, -0.45, '', ha='center', va='top',
+                        fontsize=8, color='#ff9999',
+                        transform=ax_b5.transAxes)
 
     def refresh():
         b_notch.label.set_text(f"Hum Notches: {'ON' if state['notch'] else 'OFF'}")
@@ -411,12 +463,38 @@ def build_ui(fs: int):
             fig.canvas.draw_idle()
         start_calibration(n_blocks, done)
 
+    def on_rec(_e):
+        if state['recording']:
+            # Stop and save
+            state['recording'] = False
+            raw_path, proc_path, dur = save_recording(fs)
+            b_rec.label.set_text('Record: OFF')
+            b_rec.color = '#2a2a2a'
+            if raw_path:
+                rec_st.set_text(f'Saved {dur:.1f}s ✓')
+                print(f'[record] saved {dur:.1f} s:')
+                print(f'  {raw_path}')
+                print(f'  {proc_path}')
+            else:
+                rec_st.set_text('Nothing recorded')
+        else:
+            # Start fresh recording
+            _rec_raw_blocks.clear()
+            _rec_proc_blocks.clear()
+            state['recording'] = True
+            b_rec.label.set_text('Record: REC ●')
+            b_rec.color = '#7a1a1a'
+            rec_st.set_text('Recording…')
+            print('[record] started — click Record again to stop & save')
+        fig.canvas.draw_idle()
+
     b_notch.on_clicked(lambda e: (state.update(notch=not state['notch']),    refresh()))
     b_lp.on_clicked(   lambda e: (state.update(lowpass=not state['lowpass']),refresh()))
     b_ss.on_clicked(   lambda e: (state.update(spec_sub=not state['spec_sub']),refresh()))
     b_cal.on_clicked(on_cal)
+    b_rec.on_clicked(on_rec)
 
-    fig._buttons = (b_notch, b_lp, b_ss, b_cal)
+    fig._buttons = (b_notch, b_lp, b_ss, b_cal, b_rec)
     return fig, im, line, mt
 
 
