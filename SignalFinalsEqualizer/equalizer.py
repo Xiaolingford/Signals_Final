@@ -377,6 +377,82 @@ def power_at(x, freq, fs, bw=5.0):
 
 
 # ---------------------------------------------------------------------------
+# Pitch / note detection
+# ---------------------------------------------------------------------------
+NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+
+def detect_pitch_autocorr(x: np.ndarray, fs: int,
+                          fmin: float = 70.0, fmax: float = 800.0,
+                          rms_thresh: float = 0.005,
+                          peak_ratio_thresh: float = 0.3) -> float | None:
+    """
+    Estimate fundamental frequency via autocorrelation.
+
+    The autocorrelation r[k] of a periodic signal has a peak at the lag k
+    equal to its period; freq = fs / k.  We search the lag range
+    corresponding to [fmin, fmax] (typical voice fundamentals).
+
+    Returns Hz, or None if the signal is too quiet OR the autocorrelation
+    peak isn't sharp enough (i.e. no clear pitch — could be noise/silence).
+    """
+    x = x.astype(np.float32)
+    x = x - np.mean(x)
+
+    # Silence / too-quiet check
+    rms = float(np.sqrt(np.mean(x ** 2)))
+    if rms < rms_thresh:
+        return None
+
+    # Full autocorrelation, then drop negative lags (symmetric anyway)
+    corr = np.correlate(x, x, mode='full')
+    corr = corr[len(corr) // 2:]
+
+    # Lag bounds for the target pitch range
+    lag_min = max(1, int(fs / fmax))
+    lag_max = min(len(corr) - 1, int(fs / fmin))
+    if lag_max <= lag_min:
+        return None
+
+    # Find max-correlation lag in the valid pitch range
+    region    = corr[lag_min:lag_max]
+    peak_idx  = int(np.argmax(region)) + lag_min
+
+    # Confidence: peak should be a meaningful fraction of zero-lag energy.
+    # Random noise has a flat autocorrelation past lag 0 (no clear peak).
+    if corr[peak_idx] / (corr[0] + 1e-12) < peak_ratio_thresh:
+        return None
+
+    # Parabolic interpolation around the peak — sub-sample lag accuracy,
+    # which matters because Hz = fs / lag is sensitive at small lags.
+    if 1 <= peak_idx < len(corr) - 1:
+        a, b, c = float(corr[peak_idx - 1]), float(corr[peak_idx]), float(corr[peak_idx + 1])
+        denom = (a - 2 * b + c)
+        if abs(denom) > 1e-12:
+            offset    = 0.5 * (a - c) / denom
+            peak_idx  = peak_idx + offset
+
+    if peak_idx <= 0:
+        return None
+    return fs / peak_idx
+
+
+def freq_to_note(freq: float | None) -> tuple[str, float]:
+    """
+    Convert a frequency in Hz to (note_name, cents_deviation).
+    Cents: how far off from a perfectly-tuned note (-50..+50; 0 = on pitch).
+    A4 = 440 Hz reference, midi 69.
+    """
+    if freq is None or freq <= 0:
+        return '—', 0.0
+    midi       = 12.0 * np.log2(freq / 440.0) + 69.0
+    midi_round = int(round(midi))
+    cents      = (midi - midi_round) * 100.0
+    name       = NOTE_NAMES[midi_round % 12]
+    octave     = midi_round // 12 - 1
+    return f'{name}{octave}', cents
+
+
+# ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
 def build_ui(fs: int):
@@ -404,6 +480,17 @@ def build_ui(fs: int):
     if LP_CUTOFF < fs / 2:
         ax_spec.axhline(LP_CUTOFF, color='lime', alpha=0.4, lw=0.8, ls='--')
     fig.colorbar(im, ax=ax_spec, label='dB')
+
+    # Big live note read-out in the top-right of the spectrogram.
+    # Detection happens in the animation update(); this text just displays it.
+    note_text = ax_spec.text(
+        0.985, 0.94, '',
+        ha='right', va='top',
+        fontsize=22, color='#88ff88', weight='bold', family='monospace',
+        transform=ax_spec.transAxes,
+        bbox=dict(boxstyle='round,pad=0.4', facecolor='#000000',
+                  alpha=0.55, edgecolor='#88ff88', linewidth=1.2),
+    )
 
     ax_wave = fig.add_subplot(gs[1, :])
     (line,) = ax_wave.plot(np.zeros(fs), color='cyan', lw=0.6)
@@ -495,8 +582,7 @@ def build_ui(fs: int):
     b_rec.on_clicked(on_rec)
 
     fig._buttons = (b_notch, b_lp, b_ss, b_cal, b_rec)
-    return fig, im, line, mt
-
+    return fig, im, line, mt, note_text
 
 # ---------------------------------------------------------------------------
 # Main
@@ -526,7 +612,7 @@ def run(source='mic', wav_path=None, device_in=None, device_out=None,
     _init_filters(fs)
     ring = np.zeros(fs * SPEC_SECONDS, dtype=np.float32)
 
-    fig, im, line, mt = build_ui(fs)
+    fig, im, line, mt, note_text = build_ui(fs)
     streams = []
 
     if source == 'file':
@@ -574,15 +660,36 @@ def run(source='mic', wav_path=None, device_in=None, device_out=None,
         line.set_xdata(np.arange(fs))
 
         recent = ring[-fs:]
-        cal    = '✓' if (ss and ss.calibrated) else '–'
+
+        # Live pitch detection on the most recent ~200 ms of audio.
+        # Short window = responsive; autocorrelation handles 70–800 Hz well.
+        pitch_window = ring[-fs // 5:] if len(ring) >= fs // 5 else ring
+        pitch        = detect_pitch_autocorr(pitch_window, fs)
+        note, cents  = freq_to_note(pitch)
+
+        if pitch is not None:
+            # Color-code: green if within ±15¢ of pitch, yellow if off
+            colour = '#88ff88' if abs(cents) < 15 else '#ffdd66'
+            note_text.set_color(colour)
+            note_text.get_bbox_patch().set_edgecolor(colour)
+            note_text.set_text(f'{note}  {cents:+.0f}¢')
+            pitch_str = f'{pitch:6.1f} Hz'
+            note_str  = f'{note} {cents:+.0f}¢'
+        else:
+            note_text.set_text('')
+            pitch_str = '   —'
+            note_str  = '       —'
+
+        cal = '✓' if (ss and ss.calibrated) else '–'
         mt.set_text(
+            f"Note:           {note_str}\n"
+            f"Pitch:          {pitch_str}\n"
             f"SNR (band):     {rough_snr_db(recent, fs):5.1f} dB\n"
             f"60 Hz power:    {power_at(recent, 60.0, fs):5.1f} dB\n"
-            f"Fan (~150 Hz):  {power_at(recent, 150.0, fs, bw=20):5.1f} dB\n"
             f"Calibrated:     {cal}\n"
             f"FS: {fs} Hz"
         )
-        return im, line, mt
+        return im, line, mt, note_text
 
     ani = FuncAnimation(fig, update, interval=80, blit=False, cache_frame_data=False)
     fig._ani = ani
